@@ -95,6 +95,10 @@ class AdoClient:
     def segment(self, value: str, label: str) -> str:
         return _segment(value, label)
 
+    def work_item_url(self, work_item_id: int) -> str:
+        base = str(self._client.base_url).rstrip("/")
+        return f"{base}/_apis/wit/workItems/{work_item_id}"
+
     async def request(
         self,
         method: str,

@@ -33,6 +33,17 @@ def test_api_error_can_receive_a_traceback() -> None:
 
 
 @pytest.mark.anyio
+async def test_work_item_url_has_no_double_slash() -> None:
+    settings = Settings(organization="contoso", pat=SecretStr("secret-pat"))
+
+    async with AdoClient(settings) as client:
+        url = client.work_item_url(42)
+
+    assert url == "https://dev.azure.com/contoso/_apis/wit/workItems/42"
+    assert "//" not in url.removeprefix("https://")
+
+
+@pytest.mark.anyio
 async def test_api_status_is_preserved_without_following_auth_redirects() -> None:
     settings = Settings(organization="contoso", pat=SecretStr("secret-pat"))
 

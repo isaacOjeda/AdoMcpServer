@@ -16,6 +16,7 @@ class WorkItemCreate(BaseModel):
     title: str = Field(min_length=1)
     description: str | None = None
     fields: JsonObject = Field(default_factory=dict)
+    parent_id: int | None = Field(default=None, ge=1)
 
 
 class PatchOperation(BaseModel):
@@ -32,6 +33,16 @@ class WorkItemUpdate(BaseModel):
     project: str | None = None
     work_item_id: int = Field(ge=1)
     operations: list[PatchOperation] = Field(min_length=1)
+
+
+class WorkItemLinkAdd(BaseModel):
+    model_config: ClassVar[ConfigDict] = ConfigDict(frozen=True)
+
+    project: str | None = None
+    work_item_id: int = Field(ge=1)
+    target_work_item_id: int = Field(ge=1)
+    link_type: Literal["parent", "child", "related"] = "parent"
+    comment: str | None = None
 
 
 class PullRequestCreate(BaseModel):

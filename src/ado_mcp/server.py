@@ -3,7 +3,7 @@ import os
 import sys
 from collections.abc import Awaitable, Callable
 from functools import wraps
-from typing import Final
+from typing import Final, Literal
 
 import anyio
 from mcp.server import MCPServer
@@ -19,12 +19,18 @@ from ado_mcp.models import (
     PullRequestCreate,
     PullRequestThreadCreate,
     WorkItemCreate,
+    WorkItemLinkAdd,
     WorkItemUpdate,
 )
 
 mcp: Final = MCPServer("ado-mcp")
 _MAX_PAGE_SIZE: Final = 200
 _LOGGER = logging.getLogger("ado_mcp")
+_LINK_TYPE_TO_RELATION: Final[dict[str, str]] = {
+    "parent": "System.LinkTypes.Hierarchy-Reverse",
+    "child": "System.LinkTypes.Hierarchy-Forward",
+    "related": "System.LinkTypes.Related",
+}
 
 
 def _tool_error_boundary[**P, T](
@@ -67,6 +73,15 @@ def _write_allowed(settings: Settings) -> None:
         raise ConfigurationError("write operation disabled while ADO_READ_ONLY=true")
 
 
+def relation_patch_op(
+    url: str, link_type: Literal["parent", "child", "related"], comment: str | None
+) -> JsonObject:
+    relation: JsonObject = {"rel": _LINK_TYPE_TO_RELATION[link_type], "url": url}
+    if comment is not None:
+        relation["attributes"] = {"comment": comment}
+    return {"op": "add", "path": "/relations/-", "value": relation}
+
+
 @mcp.tool()
 @_tool_error_boundary
 async def ado_work_item_get(
@@ -97,22 +112,36 @@ async def ado_work_items_query(
         )
 
 
-@mcp.tool()
-@_tool_error_boundary
-async def ado_work_item_create(request: WorkItemCreate) -> JsonObject:
-    """Create a work item when write mode is enabled."""
-    settings = _settings()
-    _write_allowed(settings)
+def work_item_create_payload(
+    request: WorkItemCreate, parent_url: str | None
+) -> JsonValue:
     fields: JsonObject = {
         "/fields/System.Title": request.title,
         **{f"/fields/{key}": value for key, value in request.fields.items()},
     }
     if request.description is not None:
         fields["/fields/System.Description"] = request.description
+    payload: JsonValue = [
+        {"op": "add", "path": key, "value": value} for key, value in fields.items()
+    ]
+    if parent_url is not None:
+        payload = [*payload, relation_patch_op(parent_url, "parent", None)]
+    return payload
+
+
+@mcp.tool()
+@_tool_error_boundary
+async def ado_work_item_create(request: WorkItemCreate) -> JsonObject:
+    """Create a work item when write mode is enabled."""
+    settings = _settings()
+    _write_allowed(settings)
     async with ado_client(settings) as client:
-        payload: JsonValue = [
-            {"op": "add", "path": key, "value": value} for key, value in fields.items()
-        ]
+        parent_url = (
+            client.work_item_url(request.parent_id)
+            if request.parent_id is not None
+            else None
+        )
+        payload = work_item_create_payload(request, parent_url)
         return await client.request(
             "POST",
             f"/{client.project(request.project)}/_apis/wit/workitems/${request.work_item_type}",
@@ -136,6 +165,31 @@ async def ado_work_item_update(request: WorkItemUpdate) -> JsonObject:
             "PATCH",
             f"/{client.project(request.project)}/_apis/wit/workitems/{request.work_item_id}",
             "update work item",
+            payload=payload,
+            content_type="application/json-patch+json",
+        )
+
+
+@mcp.tool()
+@_tool_error_boundary
+async def ado_work_item_link_add(request: WorkItemLinkAdd) -> JsonObject:
+    """Add a parent, child, or related work item link when write mode is enabled."""
+    settings = _settings()
+    _write_allowed(settings)
+    if request.work_item_id == request.target_work_item_id:
+        raise ConfigurationError("work_item_id and target_work_item_id must differ")
+    async with ado_client(settings) as client:
+        payload: JsonValue = [
+            relation_patch_op(
+                client.work_item_url(request.target_work_item_id),
+                request.link_type,
+                request.comment,
+            )
+        ]
+        return await client.request(
+            "PATCH",
+            f"/{client.project(request.project)}/_apis/wit/workitems/{request.work_item_id}",
+            "add work item link",
             payload=payload,
             content_type="application/json-patch+json",
         )
