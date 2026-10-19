@@ -1,12 +1,18 @@
+import json
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from typing import Literal
 
 import anyio
+import httpx2
 import pytest
 from mcp import Client
 from mcp.server.mcpserver.exceptions import ToolError
 from mcp.types import TextContent
 from pydantic import ValidationError
 
+from ado_mcp.client import AdoClient
+from ado_mcp.config import Settings
 from ado_mcp.models import (
     PullRequestThreadCreate,
     PullRequestThreadReply,
@@ -15,6 +21,7 @@ from ado_mcp.models import (
     WorkItemLinkAdd,
 )
 from ado_mcp.server import (
+    ado_pull_request_thread_add,
     ado_pull_request_thread_reply,
     ado_pull_request_thread_status_update,
     ado_work_item_create,
@@ -374,3 +381,159 @@ async def test_pull_request_thread_writes_are_disabled_by_default(
                 repository="repo", pull_request_id=1, thread_id=1, status="fixed"
             )
         )
+
+
+def test_thread_create_strips_file_path_whitespace() -> None:
+    request = PullRequestThreadCreate(
+        repository="repo", pull_request_id=1, content="c", file_path="  src/a.py "
+    )
+
+    payload = thread_create_payload(request)
+
+    assert isinstance(payload, dict)
+    assert payload["threadContext"] == {"filePath": "/src/a.py"}
+
+
+@pytest.mark.parametrize("file_path", ["/", " / ", ""])
+def test_thread_create_rejects_file_path_without_name(file_path: str) -> None:
+    with pytest.raises(ValidationError):
+        _ = PullRequestThreadCreate(
+            repository="repo", pull_request_id=1, content="c", file_path=file_path
+        )
+
+
+def test_thread_create_rejects_inverted_offsets_on_same_line() -> None:
+    with pytest.raises(ValidationError, match="end_offset"):
+        _ = PullRequestThreadCreate(
+            repository="repo",
+            pull_request_id=1,
+            content="c",
+            file_path="a.py",
+            start_line=4,
+            end_line=4,
+            start_offset=9,
+            end_offset=3,
+        )
+
+
+def test_thread_create_allows_smaller_end_offset_on_later_line() -> None:
+    request = PullRequestThreadCreate(
+        repository="repo",
+        pull_request_id=1,
+        content="c",
+        file_path="a.py",
+        start_line=4,
+        end_line=5,
+        start_offset=9,
+        end_offset=3,
+    )
+
+    assert request.end_offset == 3
+
+
+def _recording_client(
+    monkeypatch: pytest.MonkeyPatch, requests: list[httpx2.Request]
+) -> None:
+    monkeypatch.setenv("ADO_ORGANIZATION", "contoso")
+    monkeypatch.setenv("ADO_PAT", "secret-pat")
+    monkeypatch.setenv("ADO_READ_ONLY", "false")
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        requests.append(request)
+        return httpx2.Response(200, request=request, json={"id": 1})
+
+    @asynccontextmanager
+    async def fake_client(settings: Settings) -> AsyncGenerator[AdoClient]:
+        async with AdoClient(
+            settings, transport=httpx2.MockTransport(handler)
+        ) as client:
+            yield client
+
+    monkeypatch.setattr("ado_mcp.server.ado_client", fake_client)
+
+
+@pytest.mark.anyio
+async def test_thread_reply_posts_comment_to_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[httpx2.Request] = []
+    _recording_client(monkeypatch, requests)
+
+    result = await ado_pull_request_thread_reply(
+        PullRequestThreadReply(
+            project="proj",
+            repository="my repo",
+            pull_request_id=12,
+            thread_id=7,
+            content="done",
+        )
+    )
+
+    assert result == {"id": 1}
+    [request] = requests
+    assert request.method == "POST"
+    assert request.url.raw_path.split(b"?")[0] == (
+        b"/contoso/proj/_apis/git/repositories/my%20repo/pullrequests/12"
+        b"/threads/7/comments"
+    )
+    assert json.loads(request.content) == {
+        "content": "done",
+        "parentCommentId": 1,
+        "commentType": 1,
+    }
+
+
+@pytest.mark.anyio
+async def test_thread_status_update_patches_thread_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[httpx2.Request] = []
+    _recording_client(monkeypatch, requests)
+
+    result = await ado_pull_request_thread_status_update(
+        PullRequestThreadStatusUpdate(
+            project="proj",
+            repository="repo",
+            pull_request_id=12,
+            thread_id=7,
+            status="fixed",
+        )
+    )
+
+    assert result == {"id": 1}
+    [request] = requests
+    assert request.method == "PATCH"
+    assert request.url.path == (
+        "/contoso/proj/_apis/git/repositories/repo/pullrequests/12/threads/7"
+    )
+    assert json.loads(request.content) == {"status": 2}
+
+
+@pytest.mark.anyio
+async def test_thread_add_posts_anchored_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requests: list[httpx2.Request] = []
+    _recording_client(monkeypatch, requests)
+
+    _ = await ado_pull_request_thread_add(
+        PullRequestThreadCreate(
+            project="proj",
+            repository="repo",
+            pull_request_id=12,
+            content="c",
+            file_path="a.py",
+            start_line=2,
+        )
+    )
+
+    [request] = requests
+    assert request.method == "POST"
+    assert request.url.path == (
+        "/contoso/proj/_apis/git/repositories/repo/pullrequests/12/threads"
+    )
+    assert json.loads(request.content)["threadContext"] == {
+        "filePath": "/a.py",
+        "rightFileStart": {"line": 2, "offset": 1},
+        "rightFileEnd": {"line": 2, "offset": 1},
+    }

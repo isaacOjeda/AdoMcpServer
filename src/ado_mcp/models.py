@@ -1,6 +1,12 @@
-from typing import ClassVar, Literal, Self
+from typing import Annotated, ClassVar, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    model_validator,
+)
 
 type JsonValue = (
     str | int | float | bool | list[JsonValue] | dict[str, JsonValue] | None
@@ -68,7 +74,9 @@ class PullRequestThreadCreate(BaseModel):
     pull_request_id: int = Field(ge=1)
     content: str = Field(min_length=1)
     status: ThreadStatus = "active"
-    file_path: str | None = Field(default=None, pattern=r"\S")
+    file_path: (
+        Annotated[str, StringConstraints(strip_whitespace=True, pattern=r"[^/]")] | None
+    ) = None
     start_line: int | None = Field(default=None, ge=1)
     end_line: int | None = Field(default=None, ge=1)
     start_offset: int = Field(default=1, ge=1)
@@ -93,6 +101,12 @@ class PullRequestThreadCreate(BaseModel):
             and self.end_line < self.start_line
         ):
             raise ValueError("end_line must be >= start_line")
+        if (
+            self.start_line is not None
+            and (self.end_line or self.start_line) == self.start_line
+            and self.end_offset < self.start_offset
+        ):
+            raise ValueError("end_offset must be >= start_offset on a single line")
         if self.suggestion is not None and (
             self.start_line is None or self.side != "right"
         ):
