@@ -28,6 +28,20 @@ Keep `ADO_READ_ONLY=true` until read operations are verified. Never commit the P
 parent as part of creation. `ado_work_item_link_add` adds a `parent`, `child`, or
 `related` link between two existing work items. Both require `ADO_READ_ONLY=false`.
 
+## Pull request comments
+
+`ado_pull_request_thread_add` creates a review thread. Without `file_path` it is a
+general PR comment. With `file_path` it attaches to that file, and `start_line`
+(plus optional `end_line`, `start_offset`, `end_offset`) anchors it to lines on the
+`right` (new code, default) or `left` (old code) `side` of the diff. `suggestion`
+adds an Azure DevOps suggested change for the anchored right-side lines, and
+`status` sets the initial thread status (`active` by default).
+
+`ado_pull_request_thread_reply` replies to an existing thread by `thread_id`
+(use `ado_pull_request_threads_list` to find it). `ado_pull_request_thread_status_update`
+sets a thread to `active`, `fixed`, `wontFix`, `closed`, `byDesign`, or `pending`.
+All three require `ADO_READ_ONLY=false`.
+
 ## Run locally
 
 ```bash

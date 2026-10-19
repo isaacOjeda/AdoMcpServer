@@ -10,7 +10,7 @@ from mcp.server import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import TypeAdapter, ValidationError
 
-from ado_mcp.client import ado_client
+from ado_mcp.client import AdoClient, ado_client
 from ado_mcp.config import Settings
 from ado_mcp.errors import AdoApiError, ConfigurationError
 from ado_mcp.models import (
@@ -18,6 +18,9 @@ from ado_mcp.models import (
     JsonValue,
     PullRequestCreate,
     PullRequestThreadCreate,
+    PullRequestThreadReply,
+    PullRequestThreadStatusUpdate,
+    ThreadStatus,
     WorkItemCreate,
     WorkItemLinkAdd,
     WorkItemUpdate,
@@ -31,6 +34,15 @@ _LINK_TYPE_TO_RELATION: Final[dict[str, str]] = {
     "child": "System.LinkTypes.Hierarchy-Forward",
     "related": "System.LinkTypes.Related",
 }
+_THREAD_STATUS_TO_CODE: Final[dict[ThreadStatus, int]] = {
+    "active": 1,
+    "fixed": 2,
+    "wontFix": 3,
+    "closed": 4,
+    "byDesign": 5,
+    "pending": 6,
+}
+_TEXT_COMMENT_TYPE: Final = 1
 
 
 def _tool_error_boundary[**P, T](
@@ -381,26 +393,117 @@ async def ado_pull_request_create(request: PullRequestCreate) -> JsonObject:
         )
 
 
+def _thread_path(
+    client: AdoClient, project: str | None, repository: str, pull_request_id: int
+) -> str:
+    return (
+        f"/{client.project(project)}/_apis/git/repositories/"
+        f"{client.segment(repository, 'repository')}"
+        f"/pullrequests/{pull_request_id}/threads"
+    )
+
+
+def thread_create_payload(request: PullRequestThreadCreate) -> JsonValue:
+    content = request.content
+    if request.suggestion is not None:
+        content = f"{content}\n\n```suggestion\n{request.suggestion}\n```"
+    payload: JsonObject = {
+        "comments": [
+            {
+                "content": content,
+                "parentCommentId": 0,
+                "commentType": _TEXT_COMMENT_TYPE,
+            }
+        ],
+        "status": _THREAD_STATUS_TO_CODE[request.status],
+    }
+    if request.file_path is not None:
+        context: JsonObject = {"filePath": f"/{request.file_path.lstrip('/')}"}
+        if request.start_line is not None:
+            end_line = request.end_line or request.start_line
+            context[f"{request.side}FileStart"] = {
+                "line": request.start_line,
+                "offset": request.start_offset,
+            }
+            context[f"{request.side}FileEnd"] = {
+                "line": end_line,
+                "offset": request.end_offset,
+            }
+        payload["threadContext"] = context
+    return payload
+
+
+def thread_reply_payload(request: PullRequestThreadReply) -> JsonValue:
+    return {
+        "content": request.content,
+        "parentCommentId": request.parent_comment_id,
+        "commentType": _TEXT_COMMENT_TYPE,
+    }
+
+
 @mcp.tool()
 @_tool_error_boundary
 async def ado_pull_request_thread_add(request: PullRequestThreadCreate) -> JsonObject:
-    """Add a general review comment thread to a pull request."""
+    """Add a review comment thread to a pull request.
+
+    Without file_path the thread is a general PR comment. With file_path it is
+    attached to that file; add start_line (and optionally end_line) to anchor it
+    to lines on the right (new) or left (old) side of the diff. A suggestion is
+    rendered as an Azure DevOps suggested change on the right side.
+    """
     settings = _settings()
     _write_allowed(settings)
-    payload: JsonValue = {
-        "comments": [{"content": request.content, "parentCommentId": 0}],
-        "status": 1,
-    }
+    payload = thread_create_payload(request)
+    async with ado_client(settings) as client:
+        return await client.request(
+            "POST",
+            _thread_path(
+                client, request.project, request.repository, request.pull_request_id
+            ),
+            "add pull request thread",
+            payload=payload,
+        )
+
+
+@mcp.tool()
+@_tool_error_boundary
+async def ado_pull_request_thread_reply(request: PullRequestThreadReply) -> JsonObject:
+    """Reply to an existing pull request thread when write mode is enabled."""
+    settings = _settings()
+    _write_allowed(settings)
     async with ado_client(settings) as client:
         return await client.request(
             "POST",
             (
-                f"/{client.project(request.project)}/_apis/git/repositories/"
-                f"{client.segment(request.repository, 'repository')}"
-                f"/pullrequests/{request.pull_request_id}/threads"
+                _thread_path(
+                    client, request.project, request.repository, request.pull_request_id
+                )
+                + f"/{request.thread_id}/comments"
             ),
-            "add pull request thread",
-            payload=payload,
+            "reply to pull request thread",
+            payload=thread_reply_payload(request),
+        )
+
+
+@mcp.tool()
+@_tool_error_boundary
+async def ado_pull_request_thread_status_update(
+    request: PullRequestThreadStatusUpdate,
+) -> JsonObject:
+    """Resolve, close, or reactivate a pull request thread."""
+    settings = _settings()
+    _write_allowed(settings)
+    async with ado_client(settings) as client:
+        return await client.request(
+            "PATCH",
+            (
+                _thread_path(
+                    client, request.project, request.repository, request.pull_request_id
+                )
+                + f"/{request.thread_id}"
+            ),
+            "update pull request thread status",
+            payload={"status": _THREAD_STATUS_TO_CODE[request.status]},
         )
 
 
